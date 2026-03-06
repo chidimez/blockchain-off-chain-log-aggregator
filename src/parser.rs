@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::{self, Read};
 
-use crate::protocol::{PacketType, MAGIC_BYTE};
+use crate::protocol::{MAX_PAYLOAD_LEN, PacketType, MAGIC_BYTE};
 
 #[derive(Debug, Clone)]
 pub struct PacketHeader {
@@ -24,6 +24,11 @@ pub enum ParseError {
     TruncatedHeader { at_offset: u64 },
     TruncatedPayload { at_offset: u64, expected: u16 },
     MissingChecksum { at_offset: u64 },
+    OversizedPayload {
+        at_offset: u64,
+        payload_len: u16,
+        max_allowed: u16,
+    },
 }
 
 impl std::convert::From<io::Error> for ParseError {
@@ -39,7 +44,10 @@ impl fmt::Display for ParseError {
             ParseError::TruncatedHeader { at_offset } => {
                 write!(f, "EOF while reading packet header at offset {}", at_offset)
             }
-            ParseError::TruncatedPayload { at_offset, expected } => {
+            ParseError::TruncatedPayload {
+                at_offset,
+                expected,
+            } => {
                 write!(
                     f,
                     "EOF while reading payload at offset {}, expected {} payload bytes",
@@ -48,6 +56,17 @@ impl fmt::Display for ParseError {
             }
             ParseError::MissingChecksum { at_offset } => {
                 write!(f, "EOF while reading checksum at offset {}", at_offset)
+            }
+            ParseError::OversizedPayload {
+                at_offset,
+                payload_len,
+                max_allowed,
+            } => {
+                write!(
+                    f,
+                    "payload length {} exceeds maximum allowed {} at offset {}",
+                    payload_len, max_allowed, at_offset
+                )
             }
         }
     }
@@ -77,7 +96,7 @@ impl<R: Read> StreamParser<R> {
     /// Returns:
     /// - Ok(Some(packet)) for a fully framed packet
     /// - Ok(None) for clean EOF before the next packet starts
-    /// - Err(ParseError) for truncation or I/O failure
+    /// - Err(ParseError) for truncation, oversized payload, or I/O failure
     ///
     /// If bad magic is encountered, the parser scans forward byte-by-byte until
     /// the next magic byte is found, then resumes framing from there.
@@ -138,6 +157,14 @@ impl<R: Read> StreamParser<R> {
             .map_err(|_| ParseError::TruncatedHeader {
                 at_offset: self.offset,
             })?;
+
+        if payload_len > MAX_PAYLOAD_LEN {
+            return Err(ParseError::OversizedPayload {
+                at_offset: packet_start,
+                payload_len,
+                max_allowed: MAX_PAYLOAD_LEN,
+            });
+        }
 
         let mut payload = vec![0u8; payload_len as usize];
         if read_exact_required(&mut self.reader, payload.as_mut_slice(), &mut self.offset).is_err()
@@ -207,4 +234,120 @@ fn read_exact_required<R: Read>(
     reader.read_exact(out)?;
     *offset += out.len() as u64;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn xor_checksum(payload: &[u8]) -> u8 {
+        payload.iter().fold(0u8, |acc, &b| acc ^ b)
+    }
+
+    fn build_packet(packet_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(MAGIC_BYTE);
+        packet.push(packet_type);
+        packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet.push(xor_checksum(payload));
+        packet
+    }
+
+    fn build_header_only_packet(packet_type: u8, payload_len: u16) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(MAGIC_BYTE);
+        packet.push(packet_type);
+        packet.extend_from_slice(&payload_len.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn next_packet_reads_valid_packet() {
+        let payload = b"abcd";
+        let bytes = build_packet(0xFF, payload);
+
+        let mut parser = StreamParser::new(Cursor::new(bytes));
+
+        let packet = parser
+            .next_packet()
+            .expect("parser should not error")
+            .expect("expected one packet");
+
+        assert_eq!(packet.offset, 0);
+        assert_eq!(packet.header.packet_type, PacketType::KeepAlive);
+        assert_eq!(packet.header.payload_len, 4);
+        assert_eq!(packet.payload, payload);
+        assert_eq!(packet.checksum, xor_checksum(payload));
+    }
+
+    #[test]
+    fn next_packet_returns_none_on_clean_eof() {
+        let mut parser = StreamParser::new(Cursor::new(Vec::<u8>::new()));
+
+        let result = parser.next_packet().expect("clean EOF should not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn next_packet_rejects_oversized_payload_before_allocation() {
+        let oversized_len = MAX_PAYLOAD_LEN + 1;
+        let bytes = build_header_only_packet(0x01, oversized_len);
+
+        let mut parser = StreamParser::new(Cursor::new(bytes));
+
+        let result = parser.next_packet();
+
+        match result {
+            Err(ParseError::OversizedPayload {
+                    at_offset,
+                    payload_len,
+                    max_allowed,
+                }) => {
+                assert_eq!(at_offset, 0);
+                assert_eq!(payload_len, oversized_len);
+                assert_eq!(max_allowed, MAX_PAYLOAD_LEN);
+            }
+            other => panic!("expected OversizedPayload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn next_packet_rejects_oversized_payload_after_resync() {
+        let oversized_len = MAX_PAYLOAD_LEN + 1;
+
+        let mut bytes = vec![0x00, 0x12, 0x34];
+        bytes.extend_from_slice(&build_header_only_packet(0x01, oversized_len));
+
+        let mut parser = StreamParser::new(Cursor::new(bytes));
+
+        let result = parser.next_packet();
+
+        match result {
+            Err(ParseError::OversizedPayload {
+                    at_offset,
+                    payload_len,
+                    max_allowed,
+                }) => {
+                assert_eq!(at_offset, 3);
+                assert_eq!(payload_len, oversized_len);
+                assert_eq!(max_allowed, MAX_PAYLOAD_LEN);
+            }
+            other => panic!("expected OversizedPayload after resync, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oversized_payload_error_has_human_readable_message() {
+        let err = ParseError::OversizedPayload {
+            at_offset: 120,
+            payload_len: 9000,
+            max_allowed: MAX_PAYLOAD_LEN,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("payload length 9000 exceeds maximum allowed"));
+        assert!(msg.contains("offset 120"));
+    }
 }

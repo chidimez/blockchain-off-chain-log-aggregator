@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     Transaction,
@@ -42,3 +44,10 @@ pub const TX_MIN_PAYLOAD_LEN: usize = TX_HASH_LEN + TX_AMOUNT_LEN;
 pub const STATE_UPDATE_PAYLOAD_LEN: usize = 33;
 pub const HEADER_LEN: usize = 4;
 pub const CHECKSUM_LEN: usize = 1;
+
+/// Operational guardrail for hostile streams.
+///
+/// The wire format allows payload lengths up to `u16::MAX`, but this ingestion
+/// engine chooses a stricter ceiling to avoid unnecessary allocation under
+/// adversarial or malformed input.
+pub const MAX_PAYLOAD_LEN: u16 = 4096;
