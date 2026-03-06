@@ -5,3 +5,4 @@ pub mod output;
 pub mod parser;
 pub mod protocol;
 pub mod validate;
+pub mod processor;

@@ -1,6 +1,5 @@
-#![allow(dead_code)]
-use std::io::{self, Read};
 use std::fmt;
+use std::io::{self, Read};
 
 use crate::protocol::{PacketType, MAGIC_BYTE};
 
@@ -27,6 +26,12 @@ pub enum ParseError {
     MissingChecksum { at_offset: u64 },
 }
 
+impl std::convert::From<io::Error> for ParseError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -45,11 +50,6 @@ impl fmt::Display for ParseError {
                 write!(f, "EOF while reading checksum at offset {}", at_offset)
             }
         }
-    }
-}
-impl std::convert::From<io::Error> for ParseError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
     }
 }
 
@@ -72,125 +72,103 @@ impl<R: Read> StreamParser<R> {
         self.offset
     }
 
-    /// Attempt to read the next packet.
+    /// Attempt to read the next packet from the stream.
     ///
     /// Returns:
-    /// - Ok(Some(packet)) when a full packet is framed
-    /// - Ok(None) when EOF is reached cleanly before starting a new packet
-    /// - Err(ParseError) for truncation or I/O errors
+    /// - Ok(Some(packet)) for a fully framed packet
+    /// - Ok(None) for clean EOF before the next packet starts
+    /// - Err(ParseError) for truncation or I/O failure
     ///
-    /// Bad magic is handled defensively by consuming bytes until MAGIC_BYTE is found.
+    /// If bad magic is encountered, the parser scans forward byte-by-byte until
+    /// the next magic byte is found, then resumes framing from there.
     pub fn next_packet(&mut self) -> Result<Option<RawPacket>, ParseError> {
         loop {
             let packet_start = self.offset;
 
             let magic = match read_u8_eof_ok(&mut self.reader, &mut self.offset)? {
-                None => return Ok(None), // clean EOF before starting a packet
+                None => return Ok(None),
                 Some(b) => b,
             };
 
-            if magic != MAGIC_BYTE {
-                let desync_start = packet_start;
-                let first_bad = magic;
-                let mut skipped = 1u64;
+            if magic == MAGIC_BYTE {
+                let packet = self.read_packet_after_magic(packet_start)?;
+                return Ok(Some(packet));
+            }
 
-                loop {
-                    let next_offset = self.offset;
-                    let next = match read_u8_eof_ok(&mut self.reader, &mut self.offset)? {
-                        None => {
-                            eprintln!(
-                                "desync @ offset {}: bad magic 0x{:02x}, skipped {} byte(s) before EOF",
-                                desync_start, first_bad, skipped
-                            );
-                            return Ok(None);
-                        }
-                        Some(b) => b,
-                    };
+            let resync_start = packet_start;
+            let first_bad = magic;
+            let mut skipped = 1u64;
 
-                    if next == MAGIC_BYTE {
+            loop {
+                let next_offset = self.offset;
+                let next = match read_u8_eof_ok(&mut self.reader, &mut self.offset)? {
+                    None => {
                         eprintln!(
-                            "desync @ offset {}: bad magic 0x{:02x}, skipped {} byte(s), resynchronized at offset {}",
-                            desync_start, first_bad, skipped, next_offset
+                            "desync @ offset {}: bad magic 0x{:02x}, skipped {} byte(s) before EOF",
+                            resync_start, first_bad, skipped
                         );
-
-                        let packet_start = next_offset;
-
-                        let raw_type = read_u8_required(&mut self.reader, &mut self.offset)
-                            .map_err(|_| ParseError::TruncatedHeader { at_offset: self.offset })?;
-                        let packet_type = PacketType::from_byte(raw_type);
-
-                        let payload_len = read_be_u16_required(&mut self.reader, &mut self.offset)
-                            .map_err(|_| ParseError::TruncatedHeader { at_offset: self.offset })?;
-
-                        let mut payload = vec![0u8; payload_len as usize];
-                        if read_exact_required(&mut self.reader, payload.as_mut_slice(), &mut self.offset).is_err() {
-                            return Err(ParseError::TruncatedPayload {
-                                at_offset: self.offset,
-                                expected: payload_len,
-                            });
-                        }
-
-                        let checksum = read_u8_required(&mut self.reader, &mut self.offset)
-                            .map_err(|_| ParseError::MissingChecksum { at_offset: self.offset })?;
-
-                        let header = PacketHeader {
-                            packet_type,
-                            payload_len,
-                        };
-
-                        let packet = RawPacket {
-                            packet_index: self.packet_index,
-                            offset: packet_start,
-                            header,
-                            payload,
-                            checksum,
-                        };
-
-                        self.packet_index += 1;
-                        return Ok(Some(packet));
+                        return Ok(None);
                     }
+                    Some(b) => b,
+                };
 
-                    skipped += 1;
+                if next == MAGIC_BYTE {
+                    eprintln!(
+                        "desync @ offset {}: bad magic 0x{:02x}, skipped {} byte(s), resynchronized at offset {}",
+                        resync_start, first_bad, skipped, next_offset
+                    );
+
+                    let packet = self.read_packet_after_magic(next_offset)?;
+                    return Ok(Some(packet));
                 }
+
+                skipped += 1;
             }
-            // Packet type (1 byte)
-            let raw_type = read_u8_required(&mut self.reader, &mut self.offset)
-                .map_err(|_| ParseError::TruncatedHeader { at_offset: self.offset })?;
-            let packet_type = PacketType::from_byte(raw_type);
-
-            // Payload length (2 bytes, big-endian)
-            let payload_len = read_be_u16_required(&mut self.reader, &mut self.offset)
-                .map_err(|_| ParseError::TruncatedHeader { at_offset: self.offset })?;
-
-            // Payload (N bytes)
-            let mut payload = vec![0u8; payload_len as usize];
-            if read_exact_required(&mut self.reader, payload.as_mut_slice(), &mut self.offset).is_err() {
-                return Err(ParseError::TruncatedPayload {
-                    at_offset: self.offset,
-                    expected: payload_len,
-                });
-            }
-
-            // Checksum (1 byte)
-            let checksum = read_u8_required(&mut self.reader, &mut self.offset)
-                .map_err(|_| ParseError::MissingChecksum { at_offset: self.offset })?;
-
-            let header = PacketHeader {
-                packet_type,
-                payload_len,
-            };
-
-            let packet = RawPacket {
-                packet_index: self.packet_index,
-                offset: packet_start,
-                header,
-                payload,
-                checksum,
-            };
-
-            self.packet_index += 1;
-            return Ok(Some(packet));
         }
+    }
+
+    fn read_packet_after_magic(&mut self, packet_start: u64) -> Result<RawPacket, ParseError> {
+        let raw_type = read_u8_required(&mut self.reader, &mut self.offset)
+            .map_err(|_| ParseError::TruncatedHeader {
+                at_offset: self.offset,
+            })?;
+        let packet_type = PacketType::from_byte(raw_type);
+
+        let payload_len = read_be_u16_required(&mut self.reader, &mut self.offset)
+            .map_err(|_| ParseError::TruncatedHeader {
+                at_offset: self.offset,
+            })?;
+
+        let mut payload = vec![0u8; payload_len as usize];
+        if read_exact_required(&mut self.reader, payload.as_mut_slice(), &mut self.offset).is_err()
+        {
+            return Err(ParseError::TruncatedPayload {
+                at_offset: self.offset,
+                expected: payload_len,
+            });
+        }
+
+        let checksum = read_u8_required(&mut self.reader, &mut self.offset).map_err(|_| {
+            ParseError::MissingChecksum {
+                at_offset: self.offset,
+            }
+        })?;
+
+        let header = PacketHeader {
+            packet_type,
+            payload_len,
+        };
+
+        let packet = RawPacket {
+            packet_index: self.packet_index,
+            offset: packet_start,
+            header,
+            payload,
+            checksum,
+        };
+
+        self.packet_index += 1;
+        Ok(packet)
     }
 }
 
@@ -221,7 +199,11 @@ fn read_be_u16_required<R: Read>(reader: &mut R, offset: &mut u64) -> Result<u16
     Ok(u16::from_be_bytes(buf))
 }
 
-fn read_exact_required<R: Read>(reader: &mut R, out: &mut [u8], offset: &mut u64) -> Result<(), io::Error> {
+fn read_exact_required<R: Read>(
+    reader: &mut R,
+    out: &mut [u8],
+    offset: &mut u64,
+) -> Result<(), io::Error> {
     reader.read_exact(out)?;
     *offset += out.len() as u64;
     Ok(())
