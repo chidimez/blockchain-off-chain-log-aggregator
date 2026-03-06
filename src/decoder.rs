@@ -55,3 +55,85 @@ fn to_hex_lower(bytes: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_transaction_payload(hash_byte: u8, amount: u64, memo: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[hash_byte; 32]);
+        payload.extend_from_slice(&amount.to_be_bytes());
+        payload.extend_from_slice(memo);
+        payload
+    }
+
+    #[test]
+    fn decode_transaction_parses_amount_and_memo() {
+        let payload = build_transaction_payload(0xAB, 1001, b"above");
+
+        let tx = decode_transaction(&payload).expect("transaction should decode");
+
+        assert_eq!(tx.amount, 1001);
+        assert_eq!(tx.memo, "above");
+        assert_eq!(tx.tx_hash, "abababababababababababababababababababababababababababababababab");
+    }
+
+    #[test]
+    fn decode_transaction_preserves_utf8_memo() {
+        let payload = build_transaction_payload(0x11, 50000, "café naïve résumé".as_bytes());
+
+        let tx = decode_transaction(&payload).expect("utf-8 memo should decode");
+
+        assert_eq!(tx.amount, 50000);
+        assert_eq!(tx.memo, "café naïve résumé");
+    }
+
+    #[test]
+    fn decode_transaction_supports_empty_memo() {
+        let payload = build_transaction_payload(0x22, 2000, b"");
+
+        let tx = decode_transaction(&payload).expect("empty memo should decode");
+
+        assert_eq!(tx.amount, 2000);
+        assert_eq!(tx.memo, "");
+    }
+
+    #[test]
+    fn decode_transaction_rejects_short_payload() {
+        let payload = vec![0u8; 39];
+
+        let result = decode_transaction(&payload);
+
+        match result {
+            Err(DecodeError::PayloadTooShort { payload_len }) => {
+                assert_eq!(payload_len, 39);
+            }
+            other => panic!("expected PayloadTooShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_transaction_rejects_invalid_utf8_memo() {
+        let invalid_utf8 = [0xFF, 0xFE, 0xFD];
+        let payload = build_transaction_payload(0x33, 3000, &invalid_utf8);
+
+        let result = decode_transaction(&payload);
+
+        match result {
+            Err(DecodeError::InvalidUtf8Memo) => {}
+            other => panic!("expected InvalidUtf8Memo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_transaction_parses_big_endian_amount_correctly() {
+        let amount = 0x0000_0000_0000_03E9u64; // 1001 decimal
+        let payload = build_transaction_payload(0x44, amount, b"big-endian");
+
+        let tx = decode_transaction(&payload).expect("transaction should decode");
+
+        assert_eq!(tx.amount, 1001);
+        assert_eq!(tx.memo, "big-endian");
+    }
+}
