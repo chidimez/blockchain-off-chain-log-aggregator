@@ -1,8 +1,3 @@
----
-
-# OPERATIONS.md
-
-```md
 # Operations Guide
 
 This document lists **all operational commands** for running the generator and ingestion engine.
